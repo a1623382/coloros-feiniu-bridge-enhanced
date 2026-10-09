@@ -2,132 +2,126 @@ package io.github.colorosfeiniu.bridge.resolver
 
 import android.app.Application
 import android.content.Context
-import io.github.libxposed.api.XposedInterface
+import de.robv.android.xposed.XC_MethodHook
+import de.robv.android.xposed.XposedBridge
+import de.robv.android.xposed.XposedHelpers
+import de.robv.android.xposed.callbacks.XC_LoadPackage
 import java.util.concurrent.atomic.AtomicBoolean
 
-/**
- * Resolves the gallery connection hooks the Enhanced line needs, in order: known obfuscated names,
- * the per-APK fingerprint cache, then DexKit semantic discovery. Ported from the legacy Xposed
- * installer to a libxposed interceptor on `Application.attach`.
- */
 internal object ConnectionResolutionBootstrap {
     fun install(
-        module: XposedInterface,
-        classLoader: ClassLoader,
-        needToken: Boolean,
-        needGallery: Boolean,
-        logger: (String) -> Unit,
+        lpparam: XC_LoadPackage.LoadPackageParam,
         tokenInstaller: (ValidatedTokenHooks, ResolutionSource) -> Unit,
         galleryInstaller: (ValidatedGalleryHooks, ResolutionSource) -> Unit,
     ) {
-        this.logger = logger
-
-        val known = KnownConnectionResolver.resolve(classLoader)
-        var tokenResolved = !needToken || installToken(
+        val known = KnownConnectionResolver.resolve(lpparam.classLoader)
+        var tokenResolved = installToken(
             refs = known.token,
-            classLoader = classLoader,
+            classLoader = lpparam.classLoader,
             installer = tokenInstaller,
         )
-        var galleryResolved = !needGallery || installGallery(
+        var galleryResolved = installGallery(
             refs = known.gallery,
-            classLoader = classLoader,
+            classLoader = lpparam.classLoader,
             installer = galleryInstaller,
         )
         if (tokenResolved && galleryResolved) return
 
         if (!attachHookInstalled.compareAndSet(false, true)) return
         runCatching {
-            val attach = Application::class.java.getDeclaredMethod("attach", Context::class.java)
-            attach.isAccessible = true
-            module.hook(attach).intercept { chain ->
-                val result = chain.proceed()
-                val context = chain.getArg(0) as? Context
-                if (context != null && resolutionStarted.compareAndSet(false, true)) {
-                    runCatching {
-                        val storageContext = context.createDeviceProtectedStorageContext()
-                        val fingerprint = GalleryFingerprint.from(context)
-                        val cache = ConnectionResolutionCache(storageContext, fingerprint)
+            XposedHelpers.findAndHookMethod(
+                Application::class.java,
+                "attach",
+                Context::class.java,
+                object : XC_MethodHook() {
+                    override fun afterHookedMethod(param: MethodHookParam) {
+                        val context = param.args.firstOrNull() as? Context ?: return
+                        if (!resolutionStarted.compareAndSet(false, true)) return
+                        runCatching {
+                            val storageContext = context.createDeviceProtectedStorageContext()
+                            val fingerprint = GalleryFingerprint.from(context)
+                            val cache = ConnectionResolutionCache(storageContext, fingerprint)
 
-                        if (!tokenResolved) {
-                            val cached = cache.readToken { refs ->
-                                ConnectionHookValidator.validateToken(
-                                    refs,
-                                    classLoader,
-                                ) != null
+                            if (!tokenResolved) {
+                                val cached = cache.readToken { refs ->
+                                    ConnectionHookValidator.validateToken(
+                                        refs,
+                                        lpparam.classLoader,
+                                    ) != null
+                                }
+                                tokenResolved = installToken(
+                                    refs = cached,
+                                    classLoader = lpparam.classLoader,
+                                    installer = tokenInstaller,
+                                )
                             }
-                            tokenResolved = installToken(
-                                refs = cached,
-                                classLoader = classLoader,
-                                installer = tokenInstaller,
-                            )
-                        }
-                        if (!galleryResolved) {
-                            val cached = cache.readGallery { refs ->
-                                ConnectionHookValidator.validateGallery(
-                                    refs,
-                                    classLoader,
-                                ) != null
+                            if (!galleryResolved) {
+                                val cached = cache.readGallery { refs ->
+                                    ConnectionHookValidator.validateGallery(
+                                        refs,
+                                        lpparam.classLoader,
+                                    ) != null
+                                }
+                                galleryResolved = installGallery(
+                                    refs = cached,
+                                    classLoader = lpparam.classLoader,
+                                    installer = galleryInstaller,
+                                )
                             }
-                            galleryResolved = installGallery(
-                                refs = cached,
-                                classLoader = classLoader,
-                                installer = galleryInstaller,
-                            )
-                        }
-                        if (tokenResolved && galleryResolved) return@runCatching
+                            if (tokenResolved && galleryResolved) return@runCatching
 
-                        val semantic = SemanticDexResolver.resolve(
-                            classLoader = classLoader,
-                            needToken = !tokenResolved,
-                            needGallery = !galleryResolved,
-                        )
-                        log(
-                            "semantic-scan tokenCandidates=${semantic.tokenCandidateCount} " +
-                                "galleryCandidates=${semantic.galleryCandidateCount} " +
-                                "elapsedMs=${semantic.elapsedMs}",
-                        )
-                        if (!tokenResolved && semantic.token != null) {
-                            tokenResolved = installToken(
-                                refs = semantic.token,
-                                classLoader = classLoader,
-                                installer = tokenInstaller,
+                            val semantic = SemanticDexResolver.resolve(
+                                classLoader = lpparam.classLoader,
+                                needToken = !tokenResolved,
+                                needGallery = !galleryResolved,
                             )
-                            if (tokenResolved) cache.writeToken(semantic.token)
-                        }
-                        if (!galleryResolved && semantic.gallery != null) {
-                            galleryResolved = installGallery(
-                                refs = semantic.gallery,
-                                classLoader = classLoader,
-                                installer = galleryInstaller,
-                            )
-                            if (galleryResolved) cache.writeGallery(semantic.gallery)
-                        }
-                        if (!tokenResolved) {
                             log(
-                                "token resolver unavailable candidates=" +
-                                    semantic.tokenCandidateCount,
+                                "semantic-scan tokenCandidates=${semantic.tokenCandidateCount} " +
+                                    "galleryCandidates=${semantic.galleryCandidateCount} " +
+                                    "elapsedMs=${semantic.elapsedMs}",
                             )
-                        }
-                        if (!galleryResolved) {
+                            if (!tokenResolved && semantic.token != null) {
+                                tokenResolved = installToken(
+                                    refs = semantic.token,
+                                    classLoader = lpparam.classLoader,
+                                    installer = tokenInstaller,
+                                )
+                                if (tokenResolved) cache.writeToken(semantic.token)
+                            }
+                            if (!galleryResolved && semantic.gallery != null) {
+                                galleryResolved = installGallery(
+                                    refs = semantic.gallery,
+                                    classLoader = lpparam.classLoader,
+                                    installer = galleryInstaller,
+                                )
+                                if (galleryResolved) cache.writeGallery(semantic.gallery)
+                            }
+                            if (!tokenResolved) {
+                                log(
+                                    "token resolver unavailable candidates=" +
+                                        semantic.tokenCandidateCount,
+                                )
+                            }
+                            if (!galleryResolved) {
+                                log(
+                                    "gallery resolver unavailable candidates=" +
+                                        semantic.galleryCandidateCount,
+                                )
+                            }
+                        }.onFailure { error ->
+                            val stage = if (error is UnsatisfiedLinkError) {
+                                "native-load"
+                            } else {
+                                "semantic-scan"
+                            }
                             log(
-                                "gallery resolver unavailable candidates=" +
-                                    semantic.galleryCandidateCount,
+                                "resolver stage=$stage result=unavailable " +
+                                    "type=${error.javaClass.simpleName}",
                             )
                         }
-                    }.onFailure { error ->
-                        val stage = if (error is UnsatisfiedLinkError) {
-                            "native-load"
-                        } else {
-                            "semantic-scan"
-                        }
-                        log(
-                            "resolver stage=$stage result=unavailable " +
-                                "type=${error.javaClass.simpleName}",
-                        )
                     }
-                }
-                result
-            }
+                },
+            )
         }.onFailure { error ->
             log(
                 "resolver stage=attach-hook result=unavailable " +
@@ -181,7 +175,7 @@ internal object ConnectionResolutionBootstrap {
                 true
             }
         }
-        if (shouldLog) logger.invoke(message)
+        if (shouldLog) XposedBridge.log("ColorOSFeiniuBridge: $message")
     }
 
     private const val MAX_LOG_EVENTS = 40
@@ -189,7 +183,4 @@ internal object ConnectionResolutionBootstrap {
     private val resolutionStarted = AtomicBoolean(false)
     private val logLock = Any()
     private var loggedEvents = 0
-
-    @Volatile
-    private var logger: (String) -> Unit = {}
 }
